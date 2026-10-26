@@ -75,6 +75,8 @@ EXPECTED_TYPES_EXPORTS = [
     "AskForApproval",
     "CancelLoginAccountResponse",
     "CancelLoginAccountStatus",
+    "CommandExecParams",
+    "CommandExecResponse",
     "GetAccountResponse",
     "InitializeResponse",
     "JsonObject",

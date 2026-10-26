@@ -1,5 +1,6 @@
 import json
 import os
+import queue
 import re
 import subprocess
 import threading
@@ -209,6 +210,8 @@ class CodexConfig:
     client_title: str = "Codex Python SDK"
     client_version: str = SDK_VERSION
     experimental_api: bool = True
+    start_new_session: bool = False
+    rpc_timeout_seconds: float | None = None
 
 
 class CodexClient:
@@ -275,6 +278,7 @@ class CodexClient:
             cwd=self.config.cwd,
             env=env,
             bufsize=1,
+            start_new_session=self.config.start_new_session,
         )
 
         self._start_stderr_drain_thread()
@@ -379,7 +383,17 @@ class CodexClient:
             self._router.discard_response_waiter(request_id)
             raise
 
-        item = waiter.get()
+        try:
+            item = (
+                waiter.get()
+                if self.config.rpc_timeout_seconds is None
+                else waiter.get(timeout=self.config.rpc_timeout_seconds)
+            )
+        except queue.Empty:
+            self._router.discard_response_waiter(request_id)
+            raise TimeoutError(
+                f"{method} response deadline exceeded; server execution may still be active"
+            ) from None
         if isinstance(item, BaseException):
             raise item
         return item

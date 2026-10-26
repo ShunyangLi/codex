@@ -79,6 +79,7 @@ mod remote_control_cmd;
 mod sandbox_setup;
 mod sandbox_uninstall;
 mod state_db_recovery;
+mod task_tree;
 #[cfg(not(windows))]
 mod wsl_paths;
 
@@ -146,6 +147,8 @@ struct MultitoolCli {
 
 #[derive(Debug, clap::Subcommand)]
 enum Subcommand {
+    /// [experimental] Run the persistent Python task-tree controller with Jev.
+    TaskTree(task_tree::TaskTreeCommand),
     /// Browse all agent sessions on the shared local app-server daemon.
     Agents(AgentsCommand),
 
@@ -1155,6 +1158,9 @@ async fn cli_main(
         }
         Some(Subcommand::TcpTunnel(args)) => {
             return codex_tcp_tunnel::run(args).await;
+        }
+        Some(Subcommand::TaskTree(command)) => {
+            task_tree::run(command).await?;
         }
         Some(Subcommand::Exec(mut exec_cli)) => {
             reject_remote_mode_for_subcommand(
@@ -2359,6 +2365,7 @@ fn unsupported_subcommand_name_for_strict_config(
         Some(Subcommand::StdioToUds(_)) => Some("stdio-to-uds"),
         Some(Subcommand::Features(_)) => Some("features"),
         Some(Subcommand::TcpTunnel(_)) => Some("tcp-tunnel"),
+        Some(Subcommand::TaskTree(_)) => Some("task-tree"),
     }
 }
 

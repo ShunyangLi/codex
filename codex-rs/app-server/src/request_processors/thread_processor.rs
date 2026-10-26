@@ -1518,6 +1518,10 @@ impl ThreadRequestProcessor {
                 .then_some(ThreadHistoryMode::Paginated)
         });
         let mut thread_extension_init = ExtensionDataInit::new();
+        if std::env::var("CODEX_TASK_TREE_WORKER").as_deref() == Ok("1") {
+            thread_extension_init.insert(crate::task_tree_worker::policy());
+            thread_extension_init.insert(codex_core::McpServersDisabled);
+        }
         if !selected_capability_roots.is_empty() {
             thread_extension_init.insert(selected_capability_roots);
         }

@@ -45,6 +45,8 @@ from .async_client import AsyncCodexClient
 from .client import CodexClient, CodexConfig
 from .generated.v2_all import (
     ApiKeyLoginAccountParams,
+    CommandExecParams,
+    CommandExecResponse,
     GetAccountParams,
     GetAccountResponse,
     LoginAccountParams,
@@ -130,6 +132,14 @@ class Codex:
     def logout(self) -> None:
         """Clear the current Codex account session."""
         self._client.account_logout()
+
+    def command_exec(self, params: CommandExecParams) -> CommandExecResponse:
+        """Execute argv without a thread; pass an explicit sandbox policy when needed."""
+        return self._client.request(
+            "command/exec",
+            params.model_dump(mode="json", by_alias=True, exclude_none=True),
+            response_model=CommandExecResponse,
+        )
 
     # BEGIN GENERATED: Codex.flat_methods
     def thread_start(
@@ -342,6 +352,15 @@ class AsyncCodex:
                 self._init = None
                 self._initialized = False
                 raise
+
+    async def command_exec(self, params: CommandExecParams) -> CommandExecResponse:
+        """Execute argv without a thread; this does not inherit thread permissions."""
+        await self._ensure_initialized()
+        return await self._client.request(
+            "command/exec",
+            params.model_dump(mode="json", by_alias=True, exclude_none=True),
+            response_model=CommandExecResponse,
+        )
 
     @property
     def metadata(self) -> InitializeResponse:

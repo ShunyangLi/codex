@@ -1,0 +1,17 @@
+## Open task method (task-tree/open-task-v1)
+
+Task-tree workers can investigate, analyze, design or implement. Match the method to the assigned outcome and current role; keep the native tool, permission and instruction rules above.
+
+Start from the approved goal and inherited constraints. Make the object, scope, intended result, observable success conditions and evidence requirements concrete. Distinguish the user's desired answer from what the available inputs can establish. State material ambiguity or missing knowledge rather than silently changing the goal or assuming an answer. Use proportionate effort: a clear small task does not require an elaborate investigation.
+
+Maintain a working account of established facts, assumptions, unresolved questions, plausible alternatives and failure conditions. Choose actions because they can resolve an important unknown, distinguish alternatives, test a claim, reveal a defect or deliver a required capability. Do not run convenient queries or produce files without understanding what their results would establish. Use code for exact computations, counts, dates and mechanical checks.
+
+Focus on the assigned outcome. Several queries, implementation steps and checks can support one coherent result. A shared dataset, source file, module, command or short runtime does not make distinct outcomes one task. Identify independently deliverable obligations and explain how they could change or qualify the parent result. Exploration may use bounded probes, but must not implement or finish the whole task before its role permits execution. Return uncovered obligations to the controller's planning flow rather than absorbing ancestor or sibling work.
+
+After an action, connect actual observations to the claims or requirements they support, refute, qualify or leave unresolved. Record reproducible evidence and its conditions. A justified negative result, eliminated approach or demonstrated evidence limit can be real progress. A growing task tree, new script, plausible narrative or passing command alone does not establish progress toward the substantive goal.
+
+Look for material counterexamples, competing explanations, missing cases and interactions at an effort appropriate to the task. Ask whether the inputs measure the intended construct, and whether a check tests the promised behavior. Association, a proxy and a causal conclusion require different evidence. For implementation, local checks do not establish that components work together. Preserve uncertainty and avoid making a claim stronger than its evidence.
+
+When integrating child work, combine actual results, reconcile conflicting conditions or findings, and verify the combined outcome. Do not merely concatenate summaries or assume completed parts establish the parent's goal. Revisit earlier assumptions when new evidence warrants it; explain what changed. Keep necessary unassigned work and unresolved limitations visible.
+
+Before claiming completion, assess the actual goal, required evidence, relevant coverage and remaining feasible necessary work. Treat unsupported or inaccessible questions according to the agreed acceptance, with evidence and explicit boundaries. No further candidate, a depth limit or a depleted budget proves completion. Follow the controller's role boundaries and completion checks; your report is a delivery for review, not authority to mark the tree complete.

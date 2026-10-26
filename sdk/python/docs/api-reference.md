@@ -110,6 +110,29 @@ compatibility. This field is deprecated and always `False` on the current
 app-server; it describes selectable personality, not the separate
 `Personality.none` opt-out.
 
+## Standalone command execution
+
+`Codex.command_exec(params: CommandExecParams) -> CommandExecResponse` and
+`await AsyncCodex.command_exec(params)` forward the existing `command/exec` RPC
+on the same connection. Import both protocol types from `openai_codex.types`.
+
+```python
+from openai_codex.types import CommandExecParams
+
+result = codex.command_exec(CommandExecParams(
+    command=["python3", "check.py"], cwd="/project", timeout_ms=30_000,
+))
+assert result.exit_code == 0, result.stderr
+```
+
+The command does not inherit a thread's sandbox. Supply the appropriate
+`sandbox_policy` when a fixed boundary is required. RPC errors propagate.
+`CodexConfig.rpc_timeout_seconds` optionally bounds waiting for any response;
+an RPC deadline does **not** confirm that server execution stopped. The caller
+must recover or terminate it before retrying side effects. Its default `None`
+retains existing behavior. `start_new_session=True` starts the local app-server
+in a separate OS session, for controllers that own process-group cleanup.
+
 ## AsyncCodex (async parity)
 
 ```python

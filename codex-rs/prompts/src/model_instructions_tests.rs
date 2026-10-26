@@ -98,3 +98,30 @@ fn missing_and_empty_templates_render_empty_but_retain_presence() {
         );
     }
 }
+
+#[test]
+fn native_task_tree_method_requires_both_private_worker_and_selected_profile() {
+    for (worker, profile, expected) in [
+        (None, None, false),
+        (None, Some("open-task-v1"), false),
+        (Some("1"), None, false),
+        (Some("1"), Some("default"), false),
+        (Some("1"), Some("open-task-v1"), true),
+    ] {
+        assert_eq!(task_tree_profile_enabled(worker, profile), expected);
+    }
+}
+
+#[test]
+fn native_task_tree_method_keeps_model_instructions_and_survives_plan_filtering() {
+    let original = "Native tool rules\n\n## Planning\nYou have access to an `update_plan` tool\n";
+    assert_eq!(with_task_tree_method(original.to_string(), false), original);
+    let augmented = with_task_tree_method(original.to_string(), true);
+    assert!(augmented.starts_with(original));
+    assert_eq!(with_task_tree_method(augmented.clone(), true), augmented);
+    let filtered = crate::without_update_plan_instructions(&augmented);
+    assert!(filtered.contains(TASK_TREE_METHOD_MARKER));
+    assert!(filtered.starts_with("Native tool rules"));
+    assert!(!filtered.contains("You have access to an `update_plan` tool"));
+    assert!(with_task_tree_method(String::new(), true).is_empty());
+}
