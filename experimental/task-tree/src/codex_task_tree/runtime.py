@@ -35,14 +35,11 @@ from .context import (
     workspace_path,
 )
 from .decision_context import REVIEWABLE_SECTIONS
-from .jev import (
-    CONTEXT_ENCODING_VERSION,
-    DecisionContextTooLarge,
-    DecisionWorkerUnavailable,
-    decision_policy_digest,
-)
+from .jev import DecisionContextTooLarge, DecisionWorkerUnavailable
+from .luna_decision import CONTEXT_ENCODING_VERSION, decision_policy_digest
 from .models import (
     TERMINAL_ROUNDS,
+    AcceptanceCriterion,
     ArtifactRef,
     CheckChangeProposal,
     CheckReviewReport,
@@ -56,10 +53,12 @@ from .models import (
     Gap,
     NodeResult,
     NodeStatus,
+    MustSolveItem,
     PlanProposal,
     PlanRevision,
     PreparationRecord,
     PreparationReport,
+    Requirement,
     RootApproval,
     RoundKind,
     RoundPhase,
@@ -70,6 +69,7 @@ from .models import (
     Suggestion,
     TaskNode,
     TaskRound,
+    TaskSpec,
     VerificationJob,
     VerificationRecord,
     WorkerReport,
@@ -91,6 +91,15 @@ REPORT_MODELS = {
     RoundKind.CONTEXT_REVIEW: ContextReviewReport,
     RoundKind.RECONCILE: WorkerReport,
 }
+
+
+def saved_decision_context(decision) -> dict:
+    directory = Path(decision.request_ref).parent
+    for name in ("selected-context.json", "full-context.json", "source.json"):
+        source = directory / name
+        if source.is_file():
+            return json.loads(source.read_text())
+    raise FileNotFoundError(f"decision evidence context missing: {directory}")
 
 
 @dataclass(frozen=True)
@@ -378,6 +387,9 @@ def hard_complete(state: RunState, task_id: str) -> bool:
 
 
 def certificate_valid(state: RunState, task_id: str) -> bool:
+    if state.schema_version == 3:
+        from .action_runtime import completion_current
+        return completion_current(state, task_id)
     node = state.nodes[task_id]
     cert = state.completion_certificates.get(node.completion_certificate_id or "")
     return bool(
@@ -514,6 +526,8 @@ def install_plan(
 
 
 class TaskRuntime:
+    protocol_version = 2
+
     def __init__(self, store: RunStore, worker, judge, command_exec: Callable):
         self.store, self.worker, self.judge, self.command_exec = store, worker, judge, command_exec
         self.state = store.load()
@@ -522,7 +536,7 @@ class TaskRuntime:
         self._charged_at = self._started
         self._was_active = self.state.status == RunStatus.ACTIVE
         checkpoint = self.state.progress.last_active_checkpoint
-        if self._was_active and self.state.scheduler.active_work and checkpoint:
+        if self._was_active and (self.state.scheduler.active_work or self.state.scheduler.active_siblings) and checkpoint:
             self.state.progress.active_elapsed_seconds += min(
                 max(0, time.time() - checkpoint),
                 self.state.execution_profile.worker_timeout_seconds,
@@ -549,20 +563,63 @@ class TaskRuntime:
             raise ValueError("nonempty request and workspace directory required")
         root_id = identifier("task")
         state = RunState(
-            schema_version=2,
+            schema_version=cls.protocol_version,
             run_id=store.run_id,
             user_request=request,
             root_task_id=root_id,
             workspace=workspace,
             execution_profile=profile,
             input_refs=input_refs or [],
-            preparation_required=True,
+            preparation_required=cls.protocol_version != 3,
         )
-        state.workspace_lease = store.acquire_workspace(workspace)
         state.nodes[root_id] = TaskNode(
             id=root_id, parent_id=None, depth=0, created_seq=state.sequence()
         )
-        queue_round(state, root_id, RoundKind.PREPARE, "initial")
+        if cls.protocol_version == 3:
+            root = state.nodes[root_id]
+            root.specs = [
+                TaskSpec(
+                    title=" ".join(request.split())[:120],
+                    goal=request,
+                    requirements=[
+                        Requirement(
+                            id="root_goal",
+                            description=request,
+                            acceptance_ids=["root_goal"],
+                        )
+                    ],
+                    root_requirement_ids=["root_goal"],
+                    acceptance=[
+                        AcceptanceCriterion(
+                            id="root_goal",
+                            description=(
+                                "Answer every required part of the original user request with "
+                                "actual evidence or checks, and explain any unresolved limits."
+                            ),
+                            check_kind="evidence",
+                            root_requirement_ids=["root_goal"],
+                        )
+                    ],
+                )
+            ]
+            validate_spec(state, root_id, root.spec)
+            root.must_solve = [
+                MustSolveItem(
+                    problem=request,
+                    verification_method="Compare the final deliverable with every required part of the original request and its actual evidence or checks.",
+                    expected_output="A complete, evidence-backed answer to the original request with unresolved limits stated.",
+                )
+            ]
+            root.root_contribution = request
+            state.root_approval = RootApproval(
+                approved_spec_revision=root.spec.revision,
+                contract_hash=root.spec.contract_hash(),
+                user_confirmation_ref="original user request at start",
+            )
+            queue_round(state, root_id, RoundKind.EXPLORE, "initial")
+        else:
+            queue_round(state, root_id, RoundKind.PREPARE, "initial")
+        state.workspace_lease = store.acquire_workspace(workspace)
         try:
             store.save(state, None)
         except Exception:
@@ -590,7 +647,7 @@ class TaskRuntime:
         self.save()
 
     def approve_root(self, contract_hash: str, confirmation_ref: str) -> None:
-        if self.state.schema_version != 2:
+        if self.state.schema_version not in {2, 3}:
             raise ValueError("legacy task-tree protocol is inspection-only; start a fresh run")
         root = self.state.nodes[self.state.root_task_id]
         if (
@@ -839,14 +896,11 @@ class TaskRuntime:
                 "preparation": self.state.current_preparation_id,
                 "input_refs": self.state.input_refs,
                 "decision_policy": decision_policy_digest(),
+                "decision_model": self.state.execution_profile.decision_model,
                 "worker_model": self.state.execution_profile.worker_model,
                 "worker_effort": self.state.execution_profile.worker_effort,
                 "native_prompt_profile": self.state.execution_profile.native_prompt_profile,
             }
-        if self.state.execution_profile.split_decision_threshold != 0.5:
-            basis["split_decision_threshold"] = (
-                self.state.execution_profile.split_decision_threshold
-            )
         return digest(basis)
 
     def authorization_current(self, work: TaskRound, *, check_files: bool = True) -> bool:
@@ -930,7 +984,7 @@ class TaskRuntime:
         )
         # Remote source references are checked by the exploration worker.
         # Fingerprinting them as workspace paths would create false
-        # MISSING blockers and contaminate the Jev routing context.
+        # MISSING blockers and contaminate the decision context.
         required_paths = [
             *[path for path in required_paths if not external_input_ref(path)],
             *local_inputs(self.state.input_refs),
@@ -1102,7 +1156,7 @@ class TaskRuntime:
         if work.routing_basis != self.routing_basis(work.task_id) or work.routing_fingerprints != fingerprints(
             self.state.workspace, list(work.routing_fingerprints), read_roots(self.state)
         ):
-            raise ValueError("exploration inputs changed during Jev routing")
+            raise ValueError("exploration inputs changed during model routing")
         work.decision_ids = list(evaluation.decision_ids)
         work.phase, work.finished_at = RoundPhase.COMMITTED, time.time()
         self.state.nodes[work.task_id].exploration_round_ids.append(work.id)
@@ -1247,7 +1301,7 @@ class TaskRuntime:
             self._record_progress(node.id, before)
             self.save()
         except BaseException:
-            # Ctrl-C can arrive while Jev is judging proposed capabilities.
+            # Ctrl-C can arrive while the model is judging proposed capabilities.
             # Restore the last committed state before the outer controller
             # records PAUSED, so uncommitted gaps cannot stale their own route.
             self.state = self.store.load()
@@ -1406,10 +1460,31 @@ class TaskRuntime:
         }
 
     def claim_next_work(self) -> WorkRef | None:
-        choice = select_next(self.state)
-        if choice.work_ref is None:
-            return None
-        ref = choice.work_ref
+        while True:
+            choice = select_next(self.state)
+            if choice.work_ref is None:
+                return None
+            ref = choice.work_ref
+            if ref.kind == "ROUND":
+                work = self.state.rounds[ref.id]
+                requires_route = work.kind in {RoundKind.DECOMPOSE, RoundKind.EXECUTE} or (
+                    work.kind == RoundKind.RECONCILE and bool(work.authorization_round_id)
+                )
+                if requires_route and not self.authorization_current(work):
+                    work.phase, work.error = RoundPhase.CANCELLED, "routing authorization is stale"
+                    work.finished_at = time.time()
+                    node = self.state.nodes[work.task_id]
+                    node.status = NodeStatus.READY
+                    queue_round(
+                        self.state,
+                        node.id,
+                        RoundKind.EXPLORE,
+                        f"stale-authorization:{work.id}",
+                        purpose="reassess task under the current decision policy and inputs",
+                    )
+                    self.save()
+                    continue
+            break
         self.state.scheduler.wave = choice.wave_after
         self.state.scheduler.active_work = ref
         if ref.kind == "ROUND":
@@ -1549,7 +1624,7 @@ class TaskRuntime:
         self.save()
 
     def begin_preparation(self) -> None:
-        if self.state.schema_version != 2:
+        if self.state.schema_version not in {2, 3}:
             raise ValueError("legacy task-tree protocol is inspection-only; start a fresh run")
         if self.state.root_approval or self.state.scheduler.active_work:
             raise ValueError("preparation restart requires an unapproved, idle run")
@@ -1711,6 +1786,8 @@ class TaskRuntime:
                 item.evidence_refs = refs
 
     def completion_context(self, task_id: str, payload: dict) -> dict:
+        # The result has already been committed; a REVIEW draft may still say checks are pending.
+        payload = {key: value for key, value in payload.items() if key != "result_draft"}
         worker_results = []
         for key in active_subtree(self.state, task_id):
             node = self.state.nodes[key]
@@ -1780,14 +1857,8 @@ class TaskRuntime:
                             and accepted.request_ref
                         ):
                             continue
-                        directory = Path(accepted.request_ref).parent
-                        source = directory / "selected-context.json"
-                        if not source.exists():
-                            source = directory / "full-context.json"
-                        frozen = (
-                            json.loads(source.read_text())
-                            .get("frozen_files", {})
-                            .get("files/" + str(relative), {})
+                        frozen = saved_decision_context(accepted).get("frozen_files", {}).get(
+                            "files/" + str(relative), {}
                         )
                         frozen_path = Path(definition.bundle_ref) / "files" / relative
                         if (
@@ -1817,11 +1888,7 @@ class TaskRuntime:
                     or not decision.request_ref
                 ):
                     continue
-                directory = Path(decision.request_ref).parent
-                source = directory / "selected-context.json"
-                if not source.exists():
-                    source = directory / "full-context.json"
-                checked = json.loads(source.read_text()).get("review_material", {})
+                checked = saved_decision_context(decision).get("review_material", {})
                 if not any(
                     isinstance(text, str)
                     and text == material.get("text")
@@ -1918,7 +1985,7 @@ class TaskRuntime:
                 next_kind=RoundKind.RECONCILE
                 if self.state.children(task_id)
                 else RoundKind.EXECUTE,
-                purpose="execute only the scoped responsibility after Jev declined further splitting",
+                purpose="execute only the scoped responsibility after the judge declined further splitting",
                 decision_ids=decisions,
             )
         if stage != "DELIVERY":
@@ -2104,8 +2171,8 @@ class TaskRuntime:
             )
         accepted = False
         if chosen and needed:
-            # A plan is proposed before Jev rules on each responsibility. Keep
-            # the necessary portion when Jev declines an optional capability.
+            # A plan is proposed before the judge rules on each responsibility. Keep
+            # the necessary portion when it declines an optional capability.
             chosen.capability_ids = [key for key in chosen.capability_ids if key in needed]
             chosen.parent_capability_ids = [
                 key for key in chosen.parent_capability_ids if key in needed
@@ -2300,7 +2367,21 @@ class TaskRuntime:
 
     def _review_checks(self, report: WorkerReport) -> None:
         for key, reason in report.check_review.items():
-            check = self.state.check_definitions[key]
+            check = self.state.check_definitions.get(key)
+            if check is None:
+                matches = [
+                    item
+                    for item in self.state.check_definitions.values()
+                    if item.task_id == report.task_id
+                    and item.status == "PROPOSED"
+                    and json.loads((Path(item.bundle_ref) / "definition.json").read_text())[
+                        "proposal"
+                    ]["id"]
+                    == key
+                ]
+                if len(matches) != 1:
+                    raise ValueError(f"check review ID is unknown or ambiguous: {key}")
+                check = matches[0]
             if report.round_id in check.review_refs:
                 continue
             if (
@@ -2353,11 +2434,11 @@ class TaskRuntime:
                 "only authorized execution, integration or check review can publish a product result"
             )
         if report.candidates or report.capability_proposals or report.plan_proposals:
-            raise ValueError("children can only be proposed in DECOMPOSE after Jev SHOULD_SPLIT")
+            raise ValueError("children can only be proposed in DECOMPOSE after SHOULD_SPLIT approval")
         if work.kind == RoundKind.EXECUTE and not self.authorization_current(
             work, check_files=False
         ):
-            raise ValueError("execution requires a current Jev authorization")
+            raise ValueError("execution requires a current split judgment")
         if work.kind == RoundKind.RECONCILE and (
             not node.current_plan_revision_id
             or not self.state.children(node.id)
@@ -2529,7 +2610,7 @@ class TaskRuntime:
                 )
                 for c in node.spec.acceptance
                 if c.required
-            ) and not self.state.children(node.id):
+            ):
                 self.state.status, self.state.block_reason = (
                     RunStatus.BLOCKED,
                     f"human acceptance required for task {node.id}; use accept then resume",
@@ -2755,7 +2836,7 @@ class TaskRuntime:
                 )
                 work.phase, work.error, work.finished_at = (
                     RoundPhase.CANCELLED,
-                    "missing or stale Jev routing authorization",
+                    "missing or stale split routing authorization",
                     time.time(),
                 )
                 self.state.scheduler.active_work = None
@@ -2766,7 +2847,7 @@ class TaskRuntime:
                     RoundKind.SCOPE_REVIEW if refresh_review else RoundKind.EXPLORE,
                     f"stale-route:{work.id}",
                     purpose=(
-                        "refresh affected independent review and Jev routing; reuse still-current exploration facts without repeating source scans"
+                        "refresh affected independent review and split routing; reuse still-current exploration facts without repeating source scans"
                         if refresh_review
                         else work.error
                     ),
@@ -2783,6 +2864,10 @@ class TaskRuntime:
             work.integration_basis = self.integration_basis(work.task_id)
         context = build_context(self.state, work.id)
         context["decision_support"]["controller_run_directory"] = str(self.store.directory)
+        if work.kind in {RoundKind.DECOMPOSE, RoundKind.EXECUTE, RoundKind.RECONCILE}:
+            source = self.state.rounds.get(work.authorization_round_id or "")
+            if source and source.kind == RoundKind.EXPLORE and source.thread_id:
+                context["continuation_thread_id"] = source.thread_id
         if work.kind in {RoundKind.EXECUTE, RoundKind.RECONCILE}:
             for source in self.state.nodes.values():
                 if (
@@ -2885,7 +2970,7 @@ class TaskRuntime:
                 if work.kind == RoundKind.EXPLORE:
                     if report.split_opportunities:
                         raise ValueError(
-                            "split_opportunities must be []; Jev has not authorized planning"
+                            "split_opportunities must be []; the judge has not authorized planning"
                         )
                     self._validate_aspect_assessments(report.aspect_assessments, [])
                 if work.kind == RoundKind.DECOMPOSE:
@@ -2940,10 +3025,47 @@ class TaskRuntime:
         self.save()
         self._commit_report(work, report)
 
+    def _claim_same_thread_continuation(self, source: TaskRound | None) -> WorkRef | None:
+        if not (
+            source
+            and source.kind == RoundKind.EXPLORE
+            and source.phase == RoundPhase.COMMITTED
+            and source.thread_id
+            and getattr(self.worker, "supports_continuation", False)
+            and self.state.status == RunStatus.ACTIVE
+            and self.state.scheduler.active_work is None
+        ):
+            return None
+        followups = [
+            work
+            for work in self.state.rounds.values()
+            if work.task_id == source.task_id
+            and work.authorization_round_id == source.id
+            and work.kind in {RoundKind.DECOMPOSE, RoundKind.EXECUTE, RoundKind.RECONCILE}
+            and work.phase == RoundPhase.QUEUED
+        ]
+        if not followups:
+            return None
+        if len(followups) != 1:
+            raise ValueError("one exploration must authorize exactly one immediate continuation")
+        if self.state.progress.worker_attempts_started >= self.state.execution_profile.max_worker_rounds:
+            self.block("worker round budget exhausted")
+            return None
+        if self.time_left() <= 0:
+            self.block("run active time budget exhausted")
+            return None
+        work = followups[0]
+        ref = WorkRef(kind="ROUND", id=work.id)
+        self.state.scheduler.active_work = ref
+        work.phase, work.started_at = RoundPhase.PREPARING, time.time()
+        self.state.nodes[work.task_id].status = NodeStatus.RUNNING
+        self.save()
+        return ref
+
     def step(self) -> RunState:
         if self.state.schema_version != 2:
             raise ValueError(
-                "legacy task-tree protocol is inspection-only; start a fresh run for Jev-gated decomposition"
+                "legacy task-tree protocol is inspection-only; start a fresh run for model-gated decomposition"
             )
         self.state.workspace_lease = self.store.acquire_workspace(self.state.workspace)
         unresolved = self.state.workspace_lease.unresolved_execution_refs
@@ -3055,10 +3177,16 @@ class TaskRuntime:
         try:
             if self.time_left() <= 0:
                 raise TimeoutError("run active time budget exhausted")
-            if ref.kind == "ROUND":
-                self._run_round(ref.id)
-            else:
-                self._run_verification_job(ref.id)
+            while True:
+                source = self.state.rounds[ref.id] if ref.kind == "ROUND" else None
+                if source:
+                    self._run_round(ref.id)
+                else:
+                    self._run_verification_job(ref.id)
+                continuation = self._claim_same_thread_continuation(source)
+                if continuation is None:
+                    break
+                ref = continuation
         except WorkerReportError as error:
             work = self.state.rounds[ref.id]
             work.phase, work.error, work.finished_at = RoundPhase.FAILED, str(error), time.time()

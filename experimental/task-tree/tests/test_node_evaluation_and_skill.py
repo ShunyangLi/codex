@@ -50,7 +50,7 @@ def test_failed_acceptance_can_repair_a_leaf_without_creating_children(setup):
             return scope_review_report(context)
         assert context["kind"] == "EXECUTE"
         executions.append(context["round_id"])
-        assert Path(context["decision_support"]["skill"]).is_file()
+        assert context["decision_support"]["model"] == "gpt-6-luna"
         assert context["decision_support"]["controller_run_directory"] == str(
             runtime.store.directory
         )
@@ -181,7 +181,7 @@ def test_worker_skill_preview_matches_real_wire_and_does_not_call_api(
     assert result["wire_bytes"] == len(real.encoded)
     assert result["provider_token_count"] is None
     assert list(tmp_path.iterdir()) == [path]
-    assert decision_skill.instructions() in instructions_for_kind("CONTEXT_REVIEW")
+    assert decision_skill.instructions() not in instructions_for_kind("CONTEXT_REVIEW")
 
 
 def test_working_budget_is_enforced_even_below_provider_byte_ceiling(tmp_path):
@@ -269,7 +269,8 @@ def test_workspace_prefix_encoding_is_reversible_and_keeps_relative_source_names
     assert json.loads(restored) == original
 
 
-def test_frozen_check_code_is_reused_only_for_exact_reviewed_current_bytes(setup):
+@pytest.mark.parametrize("source_name", ["full-context.json", "source.json"])
+def test_frozen_check_code_is_reused_only_for_exact_reviewed_current_bytes(setup, source_name):
     runtime, judge, workspace = setup
     root = runtime.state.nodes[runtime.state.root_task_id]
     (workspace / ".checks").mkdir()
@@ -300,7 +301,7 @@ def test_frozen_check_code_is_reused_only_for_exact_reviewed_current_bytes(setup
     payload = {"frozen_files": {"files/.checks/check.py": review_file(frozen)}}
     decision = judge("CHECK_CHANGE", definition.id, payload)
     decision.request_ref = runtime.store.write_json("frozen-review/request.json", {})
-    runtime.store.write_json("frozen-review/full-context.json", payload)
+    runtime.store.write_json(f"frozen-review/{source_name}", payload)
     runtime.state.decisions[decision.id] = decision
     definition.review_refs.append(decision.id)
     authorize(runtime)

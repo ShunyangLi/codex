@@ -5,7 +5,6 @@ import os
 import re
 from pathlib import Path
 
-from .decision_skill import SKILL_DIRECTORY, support_context
 from .models import InvestigationAspect, RunState, digest
 from .store import canonical, file_hash
 
@@ -35,7 +34,7 @@ def read_roots(state: RunState) -> list[str]:
         dict.fromkeys(
             [
                 *state.input_refs,
-                str(SKILL_DIRECTORY),
+                *state.branch_workspaces.values(),
                 *(item.snapshot_ref for item in state.artifacts.values() if item.snapshot_ref),
                 *(item.bundle_ref for item in state.check_definitions.values()),
                 *(
@@ -48,8 +47,19 @@ def read_roots(state: RunState) -> list[str]:
                     for item in state.rounds.values()
                     if item.context_manifest_ref
                 ),
+                *(
+                    ref
+                    for item in state.rounds.values()
+                    for ref in (item.exploration_ref, item.delivery_ref)
+                    if ref
+                ),
                 *(item.context_ref for item in state.decision_jobs.values()),
                 *(item.output_ref for item in state.verifications.values() if item.output_ref),
+                *(
+                    ref
+                    for item in state.action_decisions.values()
+                    for ref in (item.request_ref, item.response_ref)
+                ),
                 *(
                     ref
                     for item in state.decisions.values()
@@ -79,15 +89,28 @@ def check_environment(workspace: Path, bundle: Path) -> dict[str, str]:
 
 
 def fingerprints(
-    workspace: Path, paths: list[str], input_refs: list[str] | None = None
+    workspace: Path,
+    paths: list[str],
+    input_refs: list[str] | None = None,
+    *,
+    cache: dict | None = None,
 ) -> dict[str, str]:
+    # A cache belongs to ONE read-only validation boundary, never across worker writes.
+    cache = {} if cache is None else cache
+
+    def hashed(path):
+        key = ("file", str(path.resolve()))
+        if key not in cache:
+            cache[key] = file_hash(path)
+        return cache[key]
+
     result: dict[str, str] = {}
     for relative in sorted(set(paths or ["."])):
         path = input_path(workspace, relative, input_refs or [])
         if not path.exists():
             result[relative] = "MISSING"
         elif path.is_file():
-            result[relative] = file_hash(path)
+            result[relative] = hashed(path)
         elif path.is_dir():
             entries = {}
             for directory, dirs, files in os.walk(path, followlinks=False):
@@ -114,7 +137,7 @@ def fingerprints(
                         if entry.is_relative_to(workspace)
                         else str(entry)
                     )
-                    entries[key] = file_hash(entry)
+                    entries[key] = hashed(entry)
             result[relative] = digest(entries)
         else:
             raise ValueError(f"unsupported input: {relative}")
@@ -164,14 +187,18 @@ def parse_investigation_inventory(index: dict, *, required: bool = False) -> lis
     return [value.model_dump(mode="json") for value in inventory]
 
 
-def preparation_view(state: RunState) -> dict | None:
+def preparation_view(state: RunState, *, include_documents: bool = True) -> dict | None:
     record = state.preparations.get(state.current_preparation_id or "")
     if record is None:
         return None
     artifacts = [state.artifacts[key] for key in record.artifact_ids]
-    for artifact in artifacts:
-        if not artifact.snapshot_ref or file_hash(Path(artifact.snapshot_ref)) != artifact.sha256:
-            raise ValueError("shared preparation snapshot is missing or changed; prepare again")
+    if include_documents:
+        for artifact in artifacts:
+            if (
+                not artifact.snapshot_ref
+                or file_hash(Path(artifact.snapshot_ref)) != artifact.sha256
+            ):
+                raise ValueError("shared preparation snapshot is missing or changed; prepare again")
     index = state.artifacts[record.index_artifact_id]
     content = json.loads(Path(index.snapshot_ref).read_text())
     return {
@@ -182,9 +209,11 @@ def preparation_view(state: RunState) -> dict | None:
         "knowledge_documents": {
             artifact.path: Path(artifact.snapshot_ref).read_text()
             for artifact in artifacts
-            if Path(artifact.path).suffix.lower() in {".md", ".txt"}
+            if include_documents and Path(artifact.path).suffix.lower() in {".md", ".txt"}
         },
-        "detail_policy": "The index, facts and verified Markdown/text knowledge snapshots are included in full. Other file contents remain references for worker inspection and are not assumed to have been read by the decision model.",
+        "detail_policy": "Documents are immutable snapshot references; open relevant files as needed. An omitted document is not evidence of absence."
+        if not include_documents
+        else "The index, facts and verified Markdown/text knowledge snapshots are included in full. Other file contents remain references for worker inspection and are not assumed to have been read by the decision model.",
     }
 
 
@@ -260,7 +289,11 @@ def build_context(state: RunState, round_id: str) -> dict:
         parent = state.nodes[parent].parent_id
     return {
         "user_request": state.user_request,
-        "decision_support": support_context(state.execution_profile),
+        "root_goal": state.user_request,
+        "decision_support": {
+            "model": state.execution_profile.decision_model,
+            "authority": "A fresh read-only Luna Codex thread returns one boolean judgment; only the controller updates the tree and grants write access.",
+        },
         "root": state.nodes[state.root_task_id].model_dump(mode="json"),
         "background": state.background,
         "preparation": preparation_view(state),

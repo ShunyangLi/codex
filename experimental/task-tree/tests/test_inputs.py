@@ -97,8 +97,8 @@ def test_declared_dataset_changes_revoke_routes_even_if_worker_only_lists_worksp
     assert next_kind(runtime) == RoundKind.EXECUTE
     source.write_text("changed upstream")
     runtime.worker = lambda *_: pytest.fail("stale dataset route must not execute")
-    runtime.step()
-    assert next_kind(runtime) == RoundKind.EXPLORE
+    replacement = runtime.claim_next_work()
+    assert runtime.state.rounds[replacement.id].kind == RoundKind.EXPLORE
     assert runtime.state.progress.worker_attempts_started == 1
 
 

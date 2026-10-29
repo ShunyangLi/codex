@@ -8,12 +8,14 @@ import subprocess
 import sys
 from pathlib import Path
 
+from .action_protocol import ACTION_JUDGE_INSTRUCTIONS
+from .action_runtime import ActionRuntime
 from .checks import latest_record
 from .codex_adapter import CodexAdapter
-from .decision_worker import CodexDecisionMaker
-from .jev import JevDecisionMaker, decision_endpoint, decision_key
+from .luna_decision import LunaDecisionMaker
 from .models import (
     TERMINAL_ROUNDS,
+    ActionVerdict,
     ExecutionProfile,
     NodeStatus,
     RoundKind,
@@ -26,57 +28,21 @@ from .runtime import TaskRuntime, certificate_valid, queue_round, validate_spec
 from .store import RunStore, atomic_write, file_hash
 
 
+def runtime_type(state):
+    return ActionRuntime if state.schema_version == 3 else TaskRuntime
+
+
 def add_decision_arguments(command) -> None:
-    command.add_argument("--decision-url", "--jev-url", dest="jev_url")
-    command.add_argument("--decision-model", "--jev-model", dest="jev_model")
-    command.add_argument("--decision-key-env")
-    command.add_argument("--decision-env-file", type=Path)
-    command.add_argument("--max-decision-input-bytes", type=int)
-    command.add_argument(
-        "--decision-context-bytes",
-        type=int,
-        help="Working input budget in bytes, not a provider token count",
-    )
+    command.add_argument("--decision-model", default=None)
 
 
 def decision_settings(args, current=None) -> dict:
-    url = args.jev_url or (
-        current.jev_url
-        if current
-        else "https://token-plan.cn-beijing.maas.aliyuncs.com/compatible-mode/v1"
-    )
-    aliyun = url.startswith("https://token-plan.cn-beijing.maas.aliyuncs.com/")
-    same = current is not None and url == current.jev_url
-    env_file = args.decision_env_file
-    if env_file is None:
-        env_file = (
-            current.decision_env_file
-            if same
-            else (Path(__file__).resolve().parents[4] / ".env" if aliyun else None)
-        )
-    return {
-        "jev_url": url,
-        "jev_model": args.jev_model
-        or (
-            current.jev_model
-            if same
-            else ("decision-model-preview" if aliyun else "nimble:9b-q4_K_M")
-        ),
-        "decision_key_env": args.decision_key_env
-        or (current.decision_key_env if same else ("QWEN_KEY" if aliyun else None)),
-        "decision_env_file": str(Path(env_file).expanduser().resolve()) if env_file else None,
-        "max_jev_input_bytes": args.max_decision_input_bytes
-        if args.max_decision_input_bytes is not None
-        else (current.max_jev_input_bytes if same else (262144 if aliyun else 48000)),
-        "jev_context_target_bytes": args.decision_context_bytes
-        if args.decision_context_bytes is not None
-        else (current.jev_context_target_bytes if current else 48000),
-    }
+    return {"decision_model": args.decision_model or (current.decision_model if current else "gpt-6-luna")}
 
 
 def parser() -> argparse.ArgumentParser:
     cli = argparse.ArgumentParser(
-        prog="codex task-tree", description="Persistent serial Codex task tree with Jev decisions"
+        prog="codex task-tree", description="Persistent Codex task tree with independent Luna decisions"
     )
     cli.add_argument(
         "--home",
@@ -85,18 +51,12 @@ def parser() -> argparse.ArgumentParser:
     )
     sub = cli.add_subparsers(dest="command", required=True)
     start = sub.add_parser(
-        "start", help="prepare shared background, then propose a root contract for approval"
+        "start", help="use the input as the root task and begin exploring its background"
     )
     start.add_argument("task")
     start.add_argument("--workspace", type=Path, default=Path.cwd())
     start.add_argument("--codex-bin", default=os.environ.get("CODEX_TASK_TREE_CODEX_BIN", "codex"))
     start.add_argument("--model", default=ExecutionProfile().worker_model)
-    start.add_argument(
-        "--split-threshold",
-        type=float,
-        default=ExecutionProfile().split_decision_threshold,
-        help="Jev score must be strictly above this threshold to split a task",
-    )
     start.add_argument("--effort", default="xhigh", choices=["low", "medium", "high", "xhigh"])
     start.add_argument(
         "--worker-prompt-profile",
@@ -106,6 +66,9 @@ def parser() -> argparse.ArgumentParser:
     )
     add_decision_arguments(start)
     start.add_argument("--max-rounds", type=int, default=100)
+    start.add_argument("--parallel-branches", "--parallel-siblings", dest="parallel_siblings",
+                       type=int, default=ExecutionProfile().max_parallel_siblings,
+                       help="Concurrent isolated root-child subtrees (default: 3)")
     start.add_argument("--max-seconds", type=float, default=7200)
     start.add_argument("--input", action="append", default=[])
     start.add_argument(
@@ -115,7 +78,7 @@ def parser() -> argparse.ArgumentParser:
     )
     prepare = sub.add_parser(
         "prepare",
-        help="prepare shared background and repropose an unapproved root; preserves history and budgets",
+        help="legacy protocol-2 background preparation only",
     )
     prepare.add_argument("run_id")
     add_decision_arguments(prepare)
@@ -129,7 +92,7 @@ def parser() -> argparse.ArgumentParser:
                 help="what resolved the previous blocker; counters are preserved",
             )
     approve = sub.add_parser(
-        "approve", help="record the user's approval of exactly the displayed root contract"
+        "approve", help="approve a root contract for an older run awaiting confirmation"
     )
     approve.add_argument("run_id")
     approve.add_argument("--contract", required=True)
@@ -142,7 +105,7 @@ def parser() -> argparse.ArgumentParser:
     accept.add_argument("--criterion", required=True)
     accept.add_argument("--confirmation", required=True)
     edit = sub.add_parser(
-        "spec", help="replace an unapproved proposal with a user-edited TaskSpec JSON"
+        "spec", help="edit an unapproved root proposal in an older run"
     )
     edit.add_argument("run_id")
     edit.add_argument("--file", required=True, type=Path)
@@ -155,6 +118,13 @@ def parser() -> argparse.ArgumentParser:
 
 def status(state) -> dict:
     root = state.nodes[state.root_task_id]
+
+    def root_branch(task_id):
+        node = state.nodes[task_id]
+        while node.parent_id and node.parent_id != state.root_task_id:
+            node = state.nodes[node.parent_id]
+        return node.id if node.parent_id else None
+
     proposals = [
         work
         for work in state.rounds.values()
@@ -168,7 +138,7 @@ def status(state) -> dict:
     return {
         "run_id": state.run_id,
         "schema_version": state.schema_version,
-        "execution_supported": state.schema_version == 2,
+        "execution_supported": state.schema_version in {2, 3},
         "status": state.status.value,
         "completion_current": certificate_valid(state, root.id) if state.root_approval else False,
         "revision": state.revision,
@@ -189,8 +159,11 @@ def status(state) -> dict:
             r.kind not in {RoundKind.PREPARE, RoundKind.SPECIFY} and r.started_at is not None
             for r in state.rounds.values()
         ),
-        "decision_endpoint": decision_endpoint(state.execution_profile.jev_url),
-        "decision_model": state.execution_profile.jev_model,
+        "decision_backend": "codex",
+        "decision_model": state.execution_profile.decision_model,
+        "action_decisions": len(state.action_decisions),
+        "latest_actions": [{"task_id": d.task_id, "action": d.verdict.action,
+                            "reason": d.verdict.reason} for d in list(state.action_decisions.values())[-10:]],
         "native_prompt_profile": state.execution_profile.native_prompt_profile,
         "nodes": [
             {
@@ -198,6 +171,7 @@ def status(state) -> dict:
                 "parent_id": n.parent_id,
                 "title": n.spec.title if n.specs else "Unspecified",
                 "status": n.status.value,
+                "session_mode": n.session_mode,
                 "result_revision": n.result_revision,
                 "depth": n.depth,
             }
@@ -206,6 +180,14 @@ def status(state) -> dict:
         "active_work": state.scheduler.active_work.model_dump()
         if state.scheduler.active_work
         else None,
+        "active_siblings": [ref.model_dump() for ref in state.scheduler.active_siblings],
+        "active_branches": [
+            {"root_child_id": root_branch(state.rounds[ref.id].task_id),
+             "task_id": state.rounds[ref.id].task_id,
+             "kind": state.rounds[ref.id].kind.value,
+             "phase": state.rounds[ref.id].phase.value}
+            for ref in state.scheduler.active_siblings
+        ],
         "pending_decisions": [
             job.model_dump(mode="json")
             for job in state.decision_jobs.values()
@@ -237,6 +219,10 @@ def export(store: RunStore, state) -> Path:
         for r in sorted(state.rounds.values(), key=lambda r: r.created_seq)
     ]
     lines += ["", "## Suggestions", ""] + [f"- {s.description}" for s in state.suggestions]
+    lines += ["", "## Actions", ""] + [
+        f"- {d.task_id}: {d.verdict.action} — {d.verdict.reason} ([request]({d.request_ref}), [response]({d.response_ref}))"
+        for d in state.action_decisions.values()
+    ]
     atomic_write(directory / "tree.md", "\n".join(lines).encode(), immutable=False)
     return directory
 
@@ -249,19 +235,22 @@ def run(store: RunStore) -> None:
         and Path(current_binary).resolve() != Path(state.execution_profile.codex_bin).resolve()
     ):
         raise ValueError("this run is pinned to a different Codex binary; use its recorded fork")
-    if state.schema_version != 2:
+    if state.schema_version not in {2, 3}:
         raise ValueError(
-            "legacy task-tree protocol is inspection-only; start a fresh run for Jev-gated decomposition"
+            "legacy task-tree protocol is inspection-only; start a fresh run for model-gated decomposition"
         )
     adapter = CodexAdapter(state.execution_profile, state.workspace)
     if store.load().execution_profile.worker_model != state.execution_profile.worker_model:
         store.save(state, state.revision)
-    runtime = TaskRuntime(store, adapter, None, adapter.command_exec)
-    runtime.judge = CodexDecisionMaker(
-        adapter,
-        JevDecisionMaker(state.execution_profile, store, runtime.time_left),
-        lambda: runtime.state,
+    runtime = runtime_type(state)(
+        store, adapter, None, adapter.command_exec,
+        **({"worker_factory": lambda workspace=None: CodexAdapter(
+            state.execution_profile, workspace or state.workspace
+        )}
+           if state.schema_version == 3 else {}),
     )
+    if state.schema_version == 2:
+        runtime.judge = LunaDecisionMaker(adapter, store, lambda: runtime.state, runtime.time_left)
     try:
         if runtime.state.status == RunStatus.SUCCEEDED and not certificate_valid(
             runtime.state, runtime.state.root_task_id
@@ -279,6 +268,7 @@ def run(store: RunStore) -> None:
                         "active_work": runtime.state.scheduler.active_work.model_dump()
                         if runtime.state.scheduler.active_work
                         else None,
+                        "active_siblings": [ref.model_dump() for ref in runtime.state.scheduler.active_siblings],
                     },
                     ensure_ascii=False,
                 ),
@@ -307,30 +297,42 @@ def main(argv: list[str] | None = None) -> int:
             version = subprocess.run(
                 [binary, "--version"], capture_output=True, text=True, timeout=20, check=True
             ).stdout.strip()
-            profile = ExecutionProfile(**decision_settings(args))
-            decision_key(profile)
+            profile = ExecutionProfile(
+                codex_bin=str(Path(binary).resolve()), **decision_settings(args)
+            )
             probe = None
             if args.probe_decision:
                 probe_store = RunStore(args.home, identifier("decision_probe"))
-                result = JevDecisionMaker(profile, probe_store, lambda: 30)(
-                    "COMPLETE",
-                    "failed-check",
-                    {"criterion": "The actual check must pass", "actual_check": "FAIL"},
+                source_ref = probe_store.write_json(
+                    "probe-source.json", {"actual_required_check_status": "FAIL"}
                 )
-                probe = {
-                    "score": result.score,
-                    "accepted": result.accepted,
-                    "record": result.response_ref,
-                }
+                adapter = CodexAdapter(profile, Path.cwd())
+                try:
+                    verdict = adapter.run_boolean_decision(
+                        {
+                            "kind": "JUDGE",
+                            "root_goal": "Fix one known failing required check in a bounded fixture",
+                            "question": "Choose execute, split or finish for a task whose required check currently FAILs and needs one focused repair.",
+                            "source_context_ref": source_ref,
+                            "protected_context": {"actual_required_check_status": "FAIL"},
+                            "scope": "Connectivity probe only; do not update any task.",
+                        },
+                        ActionVerdict,
+                        ACTION_JUDGE_INSTRUCTIONS,
+                        lambda *_: None,
+                        60,
+                    )
+                    probe = {"action": verdict.action, "record": probe_store.write_json("probe.json", verdict.model_dump(mode="json"))}
+                finally:
+                    adapter.close()
             print(
                 json.dumps(
                     {
                         "python": sys.executable,
                         "codex_bin": str(Path(binary).resolve()),
                         "codex_version": version,
-                        "decision_endpoint": decision_endpoint(profile.jev_url),
-                        "decision_model": profile.jev_model,
-                        "credentials_available": True,
+                        "decision_backend": "codex",
+                        "decision_model": profile.decision_model,
                         "probe": probe,
                     },
                     indent=2,
@@ -354,17 +356,17 @@ def main(argv: list[str] | None = None) -> int:
                 ),
                 worker_model=args.model,
                 worker_effort=args.effort,
-                split_decision_threshold=args.split_threshold,
                 native_prompt_profile=args.worker_prompt_profile,
                 permission_profile="workspace-write-network"
                 if args.allow_worker_network
                 else "workspace-write",
                 **decision_settings(args),
                 max_worker_rounds=args.max_rounds,
+                max_parallel_siblings=args.parallel_siblings,
                 max_active_seconds=args.max_seconds,
             )
             with store.locked():
-                TaskRuntime.create(store, args.task, args.workspace, profile, input_refs=args.input)
+                ActionRuntime.create(store, args.task, args.workspace, profile, input_refs=args.input)
                 print(f"run_id: {store.run_id}", flush=True)
                 run(store)
             return 0
@@ -378,7 +380,7 @@ def main(argv: list[str] | None = None) -> int:
             return 0
         with store.locked():
             state = store.load()
-            if state.schema_version != 2 and args.command in {
+            if state.schema_version not in {2, 3} and args.command in {
                 "prepare",
                 "spec",
                 "approve",
@@ -387,14 +389,14 @@ def main(argv: list[str] | None = None) -> int:
                 "resume",
             }:
                 raise ValueError(
-                    "legacy task-tree protocol is inspection-only; start a fresh run for Jev-gated decomposition"
+                    "legacy task-tree protocol is inspection-only; start a fresh run for model-gated decomposition"
                 )
             if args.command == "status":
                 print(json.dumps(status(state), ensure_ascii=False, indent=2))
             elif args.command == "export":
                 print(export(store, state))
             elif args.command == "release":
-                if state.scheduler.active_work or state.status not in {
+                if state.scheduler.active_work or state.scheduler.active_siblings or state.status not in {
                     RunStatus.SUCCEEDED,
                     RunStatus.CANCELLED,
                     RunStatus.AWAITING_APPROVAL,
@@ -403,6 +405,8 @@ def main(argv: list[str] | None = None) -> int:
                     raise ValueError("stop/recover active execution before releasing the workspace")
                 store.release_workspace()
             elif args.command == "prepare":
+                if state.schema_version == 3:
+                    raise ValueError("protocol 3 uses EXPLORE for background; prepare is unavailable")
                 if state.root_approval or state.scheduler.active_work:
                     raise ValueError("prepare requires an unapproved, idle run")
                 state.execution_profile = state.execution_profile.model_copy(
@@ -411,10 +415,8 @@ def main(argv: list[str] | None = None) -> int:
                 state.execution_profile = ExecutionProfile.model_validate(
                     state.execution_profile.model_dump()
                 )
-                decision_endpoint(state.execution_profile.jev_url)
-                decision_key(state.execution_profile)
                 store.save(state, state.revision)
-                runtime = TaskRuntime(store, None, None, None)
+                runtime = runtime_type(state)(store, None, None, None)
                 runtime.begin_preparation()
                 run(store)
             elif args.command == "spec":
@@ -425,6 +427,9 @@ def main(argv: list[str] | None = None) -> int:
                 proposal.revision = root.spec.revision + 1
                 validate_spec(state, root.id, proposal)
                 root.specs.append(proposal)
+                if state.schema_version == 3:
+                    root.must_solve = [r.description for r in proposal.requirements if r.required]
+                    root.root_contribution = state.user_request
                 state.coverage.clear()
                 root.coverage_ids.clear()
                 from .models import CoverageItem
@@ -443,11 +448,11 @@ def main(argv: list[str] | None = None) -> int:
                 store.save(state, state.revision)
                 print(json.dumps(status(state), ensure_ascii=False, indent=2))
             elif args.command == "approve":
-                runtime = TaskRuntime(store, None, None, None)
+                runtime = runtime_type(state)(store, None, None, None)
                 runtime.approve_root(args.contract, args.confirmation)
                 print(json.dumps(status(runtime.state), ensure_ascii=False, indent=2))
             elif args.command == "accept":
-                runtime = TaskRuntime(store, None, None, None)
+                runtime = runtime_type(state)(store, None, None, None)
                 runtime.accept_user_criterion(args.task_id, args.criterion, args.confirmation)
                 print(json.dumps(status(runtime.state), ensure_ascii=False, indent=2))
             elif args.command == "cancel":
@@ -455,6 +460,7 @@ def main(argv: list[str] | None = None) -> int:
                 refs = set(lease.unresolved_execution_refs)
                 if state.scheduler.active_work:
                     refs.add(state.scheduler.active_work.id)
+                refs.update(ref.id for ref in state.scheduler.active_siblings)
                 for key in refs:
                     work = state.rounds.get(key) or state.verification_jobs.get(key)
                     if not work:
@@ -463,9 +469,12 @@ def main(argv: list[str] | None = None) -> int:
                         CodexAdapter.ensure_stopped(work.execution_owner)
                     elif key in lease.unresolved_execution_refs:
                         raise ValueError("unknown executor identity; workspace remains reserved")
+                    if getattr(work, "decision_execution_owner", None):
+                        CodexAdapter.ensure_stopped(work.decision_execution_owner)
                     work.phase = RoundPhase.INTERRUPTED if key in state.rounds else "CANCELLED"
                     work.error = "cancelled by user after executor confirmed stopped"
                 state.scheduler.active_work = None
+                state.scheduler.active_siblings = []
                 store.execution_reservation([])
                 state.status = RunStatus.CANCELLED
                 for work in state.rounds.values():
@@ -480,9 +489,9 @@ def main(argv: list[str] | None = None) -> int:
                 store.save(state, state.revision)
                 store.release_workspace()
             elif args.command in {"run", "resume"}:
-                if state.schema_version != 2:
+                if state.schema_version not in {2, 3}:
                     raise ValueError(
-                        "legacy task-tree protocol is inspection-only; start a fresh run for Jev-gated decomposition"
+                        "legacy task-tree protocol is inspection-only; start a fresh run for model-gated decomposition"
                     )
                 if args.command == "resume":
                     if state.status not in {RunStatus.BLOCKED, RunStatus.PAUSED}:
@@ -502,7 +511,7 @@ def main(argv: list[str] | None = None) -> int:
                                 else NodeStatus.READY
                             )
                             node.block_reason = None
-                    if not state.scheduler.active_work:
+                    if not state.scheduler.active_work and not state.scheduler.active_siblings:
                         error_owners = {
                             state.verifications[key].task_id
                             for job in state.verification_jobs.values()
@@ -546,7 +555,7 @@ def main(argv: list[str] | None = None) -> int:
                                 node.status = NodeStatus.READY
                                 kind = (
                                     RoundKind.RECONCILE
-                                    if state.children(node.id)
+                                    if state.schema_version == 2 and state.children(node.id)
                                     and all(
                                         state.nodes[child].status == NodeStatus.SUCCEEDED
                                         for child in state.children(node.id)
@@ -568,6 +577,8 @@ def main(argv: list[str] | None = None) -> int:
                                     purpose="inspect_new_context_and_correct_previous_blocker: "
                                     + args.reason,
                                 )
+                                if state.schema_version == 3:
+                                    node.no_progress_rounds = 0
                     store.save(state, state.revision)
                 run(store)
         return 0

@@ -31,6 +31,7 @@ from codex_task_tree.runtime import (
     TaskRuntime,
     certificate_valid,
     hard_complete,
+    queue_round,
     validate_wait_graph,
 )
 from codex_task_tree.scheduler import select_next
@@ -603,6 +604,98 @@ def test_check_reviewer_cannot_approve_own_proposal(setup):
     )
     with pytest.raises(ValueError, match="independent"):
         runtime._review_checks(report)
+
+
+def test_check_reviewer_accepts_unique_proposal_id(setup):
+    runtime, _, _ = setup
+    root = runtime.state.nodes[runtime.state.root_task_id]
+    check = propose_check(
+        runtime.state,
+        runtime.store,
+        root.id,
+        "earlier-round",
+        CheckChangeProposal(
+            id="worker-proposal",
+            criterion_id="ok",
+            old_check_revision_id=root.spec.acceptance[0].adopted_check_revision_id,
+            check_spec=CheckSpec(),
+            reason="reviewable evidence check",
+        ),
+    )
+    report = WorkerReport(
+        task_id=root.id,
+        round_id="independent-review",
+        spec_revision=1,
+        input_digest="",
+        summary="review",
+        check_review={"worker-proposal": "accept: checked the frozen definition"},
+    )
+    runtime._review_checks(report)
+    assert check.status == "ADOPTED"
+    assert root.spec.acceptance[0].adopted_check_revision_id == check.id
+
+
+def test_stale_split_authorization_returns_to_exploration(setup):
+    runtime, _, _ = setup
+    work = authorize(runtime, RoundKind.DECOMPOSE)
+    source = runtime.state.rounds[work.authorization_round_id]
+    source.routing_basis = "old-decision-policy"
+    runtime.save()
+
+    ref = runtime.claim_next_work()
+
+    assert runtime.state.rounds[work.id].phase == RoundPhase.CANCELLED
+    assert ref is not None
+    assert runtime.state.rounds[ref.id].kind == RoundKind.EXPLORE
+
+
+def test_child_completion_reconcile_needs_no_split_authorization(setup):
+    runtime, _, _ = setup
+    root = runtime.state.root_task_id
+    for pending in runtime.state.rounds.values():
+        if pending.task_id == root and pending.phase == RoundPhase.QUEUED:
+            pending.phase = RoundPhase.CANCELLED
+    work = queue_round(runtime.state, root, RoundKind.RECONCILE, "child-delivery")
+
+    ref = runtime.claim_next_work()
+
+    assert ref.id == work.id
+    assert work.phase == RoundPhase.PREPARING
+
+
+def test_parent_waits_for_human_acceptance_after_child_delivery(setup):
+    runtime, judge, workspace = setup
+    root = runtime.state.nodes[runtime.state.root_task_id]
+    root.spec.acceptance[0].check_kind = "user"
+    root.spec.acceptance[0].adopted_check_revision_id = None
+    runtime.state.root_approval.contract_hash = root.spec.contract_hash()
+    authorize(runtime, RoundKind.DECOMPOSE)
+    runtime.worker = lambda context, *_: children_report(context, ["child"])
+    runtime.step()
+    child = runtime.state.nodes[runtime.state.children(root.id)[0]]
+    child.spec.acceptance[0].check_spec.command = [
+        sys.executable, "-c", "from pathlib import Path; assert Path('child.txt').exists()"
+    ]
+    adopt(runtime.state, runtime.store, child.id)
+    judge.denied.add("SHOULD_SPLIT")
+
+    def worker(context, *_):
+        if context["kind"] == "EXPLORE":
+            return exploration_report(context)
+        title = context["task"]["specs"][-1]["title"]
+        (workspace / f"{title}.txt").write_text("delivered")
+        return report_for(context, deliverable_paths=[f"{title}.txt"])
+
+    runtime.worker = worker
+    for _ in range(8):
+        if runtime.state.status != RunStatus.ACTIVE:
+            break
+        runtime.step()
+
+    assert runtime.state.children(root.id)
+    assert runtime.state.nodes[child.id].status == NodeStatus.SUCCEEDED
+    assert runtime.state.status == RunStatus.BLOCKED
+    assert "human acceptance required" in runtime.state.block_reason
 
 
 def test_global_budget_survives_restart(setup):

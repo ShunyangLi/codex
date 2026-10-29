@@ -114,9 +114,9 @@ def test_missing_split_decision_cannot_authorize_leaf_execution(setup):
     work = authorize(runtime)
     runtime.state.rounds[work.authorization_round_id].decision_ids = []
     runtime.worker = lambda *_: pytest.fail("incomplete routing must not execute")
-    step_route(runtime)
+    replacement = runtime.claim_next_work()
     assert work.phase == RoundPhase.CANCELLED
-    assert next_kind(runtime) == RoundKind.EXPLORE
+    assert runtime.state.rounds[replacement.id].kind == RoundKind.EXPLORE
 
 
 @pytest.mark.parametrize("essential", [False, True, None])
@@ -228,13 +228,13 @@ def test_missing_authorization_returns_to_exploration_without_running_worker(set
     work = begin_exploration(runtime)
     work.kind = kind
     runtime.worker = lambda *_: pytest.fail("unapproved route must not execute")
-    step_route(runtime)
+    replacement = runtime.claim_next_work()
     assert work.phase == RoundPhase.CANCELLED
-    assert next_kind(runtime) == RoundKind.EXPLORE
+    assert runtime.state.rounds[replacement.id].kind == RoundKind.EXPLORE
     assert runtime.state.progress.worker_attempts_started == 0
 
 
-@pytest.mark.parametrize("changed", ["files", "gap", "policy", "common-policy", "model", "effort"])
+@pytest.mark.parametrize("changed", ["files", "gap", "policy", "common-policy", "model", "judge-model", "effort"])
 def test_changed_routing_inputs_require_new_exploration(setup, changed, monkeypatch):
     runtime, judge, workspace = setup
     begin_exploration(runtime)
@@ -252,16 +252,18 @@ def test_changed_routing_inputs_require_new_exploration(setup, changed, monkeypa
 
         monkeypatch.setitem(PREDICATES, "SHOULD_SPLIT", "Updated split policy")
     elif changed == "common-policy":
-        from codex_task_tree import jev
+        from codex_task_tree import luna_decision
 
-        monkeypatch.setattr(jev, "COMMON_INSTRUCTIONS", "Updated common decision policy")
+        monkeypatch.setattr(luna_decision, "JUDGE_INSTRUCTIONS", "Updated common decision policy")
     elif changed == "model":
         runtime.state.execution_profile.worker_model = "different-worker"
+    elif changed == "judge-model":
+        runtime.state.execution_profile.decision_model = "different-judge"
     else:
         runtime.state.execution_profile.worker_effort = "high"
     runtime.worker = lambda *_: pytest.fail("stale route must not execute")
-    step_route(runtime)
-    assert next_kind(runtime) == RoundKind.EXPLORE
+    replacement = runtime.claim_next_work()
+    assert runtime.state.rounds[replacement.id].kind == RoundKind.EXPLORE
     assert runtime.state.progress.worker_attempts_started == 1
 
 

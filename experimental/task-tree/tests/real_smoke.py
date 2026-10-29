@@ -9,8 +9,7 @@ from pathlib import Path
 
 from codex_task_tree.cli import add_decision_arguments, decision_settings, export, status
 from codex_task_tree.codex_adapter import CodexAdapter
-from codex_task_tree.decision_worker import CodexDecisionMaker
-from codex_task_tree.jev import JevDecisionMaker
+from codex_task_tree.luna_decision import LunaDecisionMaker
 from codex_task_tree.models import (
     AcceptanceCriterion,
     CheckSpec,
@@ -72,8 +71,12 @@ def main():
     )
 
     class FixtureAdapter(CodexAdapter):
-        def __call__(self, context, report_type, on_started, timeout):
-            report = super().__call__(context, report_type, on_started, timeout)
+        def run_with_feedback(
+            self, context, report_type, on_started, timeout, validator=None, on_feedback=None
+        ):
+            report = super().run_with_feedback(
+                context, report_type, on_started, timeout, validator, on_feedback
+            )
             marker = store.directory / "test-fixture/fault-injection.json"
             if (
                 args.inject_parent_fault
@@ -99,9 +102,7 @@ def main():
 
     adapter = FixtureAdapter(profile, workspace)
     runtime = TaskRuntime(store, adapter, None, adapter.command_exec)
-    actual_judge = CodexDecisionMaker(
-        adapter, JevDecisionMaker(profile, store, runtime.time_left), lambda: runtime.state
-    )
+    actual_judge = LunaDecisionMaker(adapter, store, lambda: runtime.state, runtime.time_left)
 
     def fixture_judge(kind, target, context):
         # Isolate parent integration from the separately measured autonomous routing decision.
@@ -114,7 +115,7 @@ def main():
             ref = store.write_json(
                 "test-fixture/preapproved-root-split.json",
                 {
-                    "purpose": "Controlled integration test only, NOT a Jev decision or autonomous split result. Root split is preapproved; all subsequent plan, child and completion decisions use the real backend.",
+                    "purpose": "Controlled integration test only, NOT a model decision or autonomous split result. Root split is preapproved; all subsequent plan, child and completion decisions use the real backend.",
                     "context": context,
                 },
             )
@@ -213,8 +214,13 @@ def main():
     if runtime.state.status != RunStatus.SUCCEEDED:
         raise SystemExit(1)
     assert certificate_valid(runtime.state, runtime.state.root_task_id)
-    threads = [r.thread_id for r in runtime.state.rounds.values() if r.thread_id]
-    assert len(threads) == len(set(threads)) == runtime.state.progress.worker_attempts_started
+    threads = [r for r in runtime.state.rounds.values() if r.thread_id]
+    assert len(threads) == runtime.state.progress.worker_attempts_started
+    for round in threads:
+        if round.kind in {RoundKind.DECOMPOSE, RoundKind.EXECUTE, RoundKind.RECONCILE}:
+            source = runtime.state.rounds.get(round.authorization_round_id)
+            if source and source.kind == RoundKind.EXPLORE:
+                assert round.thread_id == source.thread_id
     if args.inject_parent_fault:
         fixture_decisions = [
             d
@@ -254,7 +260,7 @@ def storage_spec():
         ],
         constraints={
             "dependencies": "Python standard library only; preserve the specified public APIs.",
-            "user_restrictions": "Only the bundled Jev decision protocol skill is allowed. Do not use other skills, previous runs or external subagents. Use only the current workspace and supplied context.",
+            "user_restrictions": "Do not use skills, previous runs or external subagents. Use only the current workspace and supplied context.",
         },
         deliverables=paths,
         requirements=[
@@ -320,7 +326,7 @@ def employment_spec(dataset: Path):
             "No extra datasets, reports, classifiers or causal estimation. Multiple code steps may support one result; keep independently answerable outcomes focused.",
         ],
         constraints={
-            "sources": "Original data is read-only. Write only in this workspace; no network, prior research outputs or external agents. Only the bundled Jev protocol skill is allowed.",
+            "sources": "Original data is read-only. Write only in this workspace; no network, prior research outputs, skills or external agents.",
             "python": f"Use the installed interpreter {sys.executable}; duckdb is available for Parquet queries, do not install dependencies.",
         },
         deliverables=paths[:-1],

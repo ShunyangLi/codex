@@ -32,6 +32,15 @@ class ScheduleChoice:
 def build_work_schedule(state: RunState) -> WorkSchedule:
     from .runtime import certificate_valid
 
+    memo = {}
+
+    def complete(key):
+        if state.schema_version == 3:
+            from .action_runtime import completion_current
+
+            return completion_current(state, key, check_files=False, memo=memo)
+        return certificate_valid(state, key)
+
     view = WorkSchedule()
     advances: dict[int, list[str]] = defaultdict(list)
     for node in state.nodes.values():
@@ -40,7 +49,13 @@ def build_work_schedule(state: RunState) -> WorkSchedule:
         children = state.children(node.id)
         if children:
             view.parent_waits[node.id] = {
-                child for child in children if state.nodes[child].status != NodeStatus.SUCCEEDED
+                child
+                for child in children
+                if (
+                    not complete(child)
+                    if state.schema_version == 3
+                    else state.nodes[child].status != NodeStatus.SUCCEEDED
+                )
             }
     for work in sorted(state.rounds.values(), key=lambda item: item.created_seq):
         pending_retry = work.phase == RoundPhase.WAITING_CONTEXT and any(
@@ -50,6 +65,11 @@ def build_work_schedule(state: RunState) -> WorkSchedule:
         if work.phase != RoundPhase.QUEUED and not pending_retry:
             continue
         node = state.nodes[work.task_id]
+        replanning = (
+            state.schema_version == 3
+            and work.kind == RoundKind.EXPLORE
+            and work.purpose == "replan_blocked_inputs"
+        )
         ref = WorkRef(kind="ROUND", id=work.id)
         reason = None
         if node.status in {NodeStatus.SUPERSEDED, NodeStatus.BLOCKED}:
@@ -58,9 +78,13 @@ def build_work_schedule(state: RunState) -> WorkSchedule:
             reason = "waiting for decision context"
         elif work.kind not in {RoundKind.PREPARE, RoundKind.SPECIFY} and not state.root_approval:
             reason = "root approval required"
-        elif any(not certificate_valid(state, dep) for dep in node.depends_on):
+        elif not replanning and any(not complete(dep) for dep in node.depends_on):
             reason = "unmet dependency"
-        elif work.kind == RoundKind.RECONCILE and view.parent_waits.get(node.id):
+        elif (
+            not replanning
+            and (work.kind == RoundKind.RECONCILE or state.schema_version == 3)
+            and view.parent_waits.get(node.id)
+        ):
             reason = "waiting for child deliveries"
         if reason:
             view.not_ready[ref] = reason
@@ -95,7 +119,7 @@ def build_work_schedule(state: RunState) -> WorkSchedule:
 
 
 def select_next(state: RunState) -> ScheduleChoice:
-    if state.scheduler.active_work:
+    if state.scheduler.active_work or state.scheduler.active_siblings:
         raise ValueError("recover active work before selecting another item")
     wave = state.scheduler.wave.model_copy(deep=True) if state.scheduler.wave else None
     if state.status not in (RunStatus.ACTIVE, RunStatus.AWAITING_APPROVAL):

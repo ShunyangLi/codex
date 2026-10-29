@@ -96,8 +96,11 @@ class RunStore:
             ).fetchone()
         if row is None:
             raise FileNotFoundError(f"unknown run: {self.run_id}")
-        state = RunState.model_validate_json(row[0])
-        if state.schema_version not in {1, 2}:
+        saved = json.loads(row[0])
+        # Runs created before sibling concurrency keep their recorded serial behavior.
+        saved["execution_profile"].setdefault("max_parallel_siblings", 1)
+        state = RunState.model_validate(saved)
+        if state.schema_version not in {1, 2, 3}:
             raise ValueError("unsupported run-state schema version")
         return state
 
@@ -207,7 +210,7 @@ class RunStore:
                         f"workspace is reserved by run {run_id}; recover/release it first"
                     )
             old = leases.get(self.run_id)
-            if old and old["canonical_write_roots"] != [str(workspace)]:
+            if old and old["canonical_write_roots"][0] != str(workspace):
                 raise ValueError("run workspace cannot change")
             lease = (
                 WorkspaceLease.model_validate(old)
@@ -220,6 +223,20 @@ class RunStore:
             )
             leases[self.run_id] = lease.model_dump(mode="json")
         return lease
+
+    def reserve_branch_workspace(self, workspace: Path) -> None:
+        workspace = canonical(workspace)
+        with self.lease_registry() as leases:
+            if self.run_id not in leases:
+                raise RuntimeError("workspace lease missing")
+            for run_id, lease in leases.items():
+                if run_id != self.run_id and any(
+                    overlaps(workspace, Path(path)) for path in lease["canonical_write_roots"]
+                ):
+                    raise RuntimeError(f"branch workspace is reserved by run {run_id}")
+            roots = leases[self.run_id]["canonical_write_roots"]
+            if str(workspace) not in roots:
+                roots.append(str(workspace))
 
     def execution_reservation(self, refs: list[str]) -> None:
         with self.lease_registry() as leases:

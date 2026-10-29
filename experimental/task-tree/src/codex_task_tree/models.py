@@ -8,7 +8,7 @@ from pathlib import Path
 from typing import Any, Literal
 from uuid import uuid4
 
-from pydantic import BaseModel, ConfigDict, Field, model_validator
+from pydantic import BaseModel, ConfigDict, Field, field_validator, model_validator
 
 
 def identifier(prefix: str) -> str:
@@ -137,7 +137,7 @@ class TaskSpec(Model):
     goal: str = Field(min_length=1)
     scope: list[str] = Field(default_factory=list)
     constraints: dict[str, str] = Field(default_factory=dict)
-    deliverables: list[str] = Field(default_factory=list)
+    deliverables: list[str] = Field(default_factory=list, description="Concrete workspace-relative output file paths, not prose descriptions. The controller checks each named file after execution.")
     requirements: list[Requirement] = Field(
         default_factory=list,
         description="Only the root defines Requirement IDs. Every child specification MUST use an empty list; map existing root IDs via root_requirement_ids and acceptance mappings.",
@@ -175,6 +175,7 @@ class ExecutionProfile(Model):
     worker_model: str | None = "gpt-6-sol"
     worker_effort: str = "xhigh"
     native_prompt_profile: Literal["default", "open-task-v1"] = "default"
+    decision_model: str = "gpt-6-luna"
     jev_url: str = "http://127.0.0.1:11434"
     jev_model: str = "nimble:9b-q4_K_M"
     decision_key_env: str | None = None
@@ -182,6 +183,7 @@ class ExecutionProfile(Model):
     decision_threshold: float = Field(default=0.5, ge=0, le=1, allow_inf_nan=False)
     split_decision_threshold: float = Field(default=0.5, ge=0, le=1, allow_inf_nan=False)
     max_worker_rounds: int = Field(default=100, gt=0)
+    max_parallel_siblings: int = Field(default=3, gt=0)
     max_active_seconds: float = Field(default=7200, gt=0)
     worker_timeout_seconds: float = Field(default=600, gt=0)
     max_node_no_progress: int = Field(default=3, gt=0)
@@ -190,6 +192,7 @@ class ExecutionProfile(Model):
     codex_binary_sha256: str = ""
     code_mode_host_sha256: str = ""
     permission_profile: str = "workspace-write"
+    decision_timeout_seconds: float = Field(default=180, gt=0)
     jev_timeout_seconds: float = Field(default=120, gt=0)
     max_jev_input_bytes: int = Field(default=48000, gt=1000)
     jev_context_target_bytes: int = Field(default=48000, gt=1000)
@@ -361,14 +364,33 @@ class VerificationRecord(Model):
     input_paths: list[str] = Field(default_factory=list)
 
 
+class MustSolveItem(Model):
+    problem: str = Field(min_length=1, description="What this task must resolve.")
+    verification_method: str = Field(min_length=1, description="The concrete check to perform.")
+    expected_output: str = Field(min_length=1, description="The observable result required for completion.")
+
+
+class ResponsibilityAnswer(Model):
+    must_solve: str = Field(min_length=1)
+    answer: str = Field(min_length=1)
+    verification_status: Literal["PASS", "FAIL", "UNKNOWN"] | None = None
+    verification_result: str = ""
+    evidence_refs: list[str] = Field(default_factory=list)
+
+
 class NodeResult(Model):
     revision: int
     round_id: str
     summary: str
+    goal_answer: str = ""
+    must_solve_answers: list[ResponsibilityAnswer] = Field(default_factory=list)
     artifact_ids: list[str] = Field(default_factory=list)
     verification_ids: list[str] = Field(default_factory=list)
     decision_ids: list[str] = Field(default_factory=list)
     child_result_versions: dict[str, int] = Field(default_factory=dict)
+    dependency_result_versions: dict[str, int] = Field(default_factory=dict)
+    input_fingerprints: dict[str, str] = Field(default_factory=dict)
+    evidence: list[str] = Field(default_factory=list)
     gaps: list[Gap] = Field(default_factory=list)
 
 
@@ -389,6 +411,8 @@ class TaskNode(Model):
     parent_id: str | None
     depth: int
     created_seq: int
+    worker_thread_id: str | None = None
+    session_mode: Literal["inherit", "isolated"] = "isolated"
     created_by_round_id: str | None = None
     specs: list[TaskSpec] = Field(default_factory=list)
     child_ids: list[str] = Field(default_factory=list)
@@ -407,6 +431,13 @@ class TaskNode(Model):
     reuse_from: str | None = None
     duplicate_of_task_id: str | None = None
     exploration_round_ids: list[str] = Field(default_factory=list)
+    must_solve: list[MustSolveItem | str] = Field(default_factory=list)
+    root_contribution: str = ""
+    planning_reason: str = ""
+    reuse_links: dict[str, str] = Field(default_factory=dict)
+    blocked_inputs_digest: str | None = None
+    replan_attempts: int = 0
+    replaced_by_task_id: str | None = None
 
     @property
     def spec(self) -> TaskSpec:
@@ -434,12 +465,15 @@ class TaskRound(Model):
     thread_id: str | None = None
     turn_id: str | None = None
     worker_report_ref: str | None = None
+    exploration_ref: str | None = None
+    delivery_ref: str | None = None
     verification_ids: list[str] = Field(default_factory=list)
     decision_ids: list[str] = Field(default_factory=list)
     error: str | None = None
     started_at: float | None = None
     finished_at: float | None = None
     execution_owner: dict[str, str] = Field(default_factory=dict)
+    decision_execution_owner: dict[str, str] = Field(default_factory=dict)
     authorization_round_id: str | None = None
     routing_basis: str = ""
     routing_fingerprints: dict[str, str] = Field(default_factory=dict)
@@ -493,6 +527,7 @@ class WaveCursor(Model):
 
 class SchedulerState(Model):
     active_work: WorkRef | None = None
+    active_siblings: list[WorkRef] = Field(default_factory=list)
     wave: WaveCursor | None = None
 
 
@@ -539,6 +574,55 @@ class DecisionJob(Model):
     brief_fingerprints: dict[str, str] = Field(default_factory=dict)
 
 
+class CriterionAssessment(Model):
+    criterion_id: str
+    status: Literal["PASS", "FAIL", "UNKNOWN"]
+    reason: str = Field(min_length=1)
+    evidence_refs: list[str] = Field(
+        default_factory=list,
+        description="Exact existing file paths (relative to the supplied workspace or absolute), artifact IDs, or source URLs. No prose, commands, invented workspace/ prefix, '(missing)' suffix or line annotations. Use [] for missing evidence and explain in reason.",
+    )
+
+
+class MustSolveAssessment(Model):
+    must_solve: str = Field(min_length=1)
+    status: Literal["PASS", "FAIL", "UNKNOWN"]
+    reason: str = Field(min_length=1)
+    evidence_refs: list[str] = Field(default_factory=list)
+
+
+class ActionVerdict(Model):
+    action: Literal["drill_down", "execute", "finish"] = Field(
+        description="drill_down pursues a relevant deeper question; execute solves the current bounded task; finish confirms an actual completed result."
+    )
+    reason: str = Field(min_length=1)
+    acceptance: list[CriterionAssessment] = Field(default_factory=list)
+    must_solve_assessments: list[MustSolveAssessment] = Field(
+        default_factory=list,
+        description="One assessment for every current must_solve item, in order, for all three actions.",
+    )
+    remaining_work: list[str] = Field(default_factory=list)
+    blocked_on: list[str] = Field(default_factory=list)
+
+    @field_validator("action", mode="before")
+    @classmethod
+    def read_legacy_action(cls, value):
+        return "drill_down" if value == "split" else value
+
+
+class ActionDecision(Model):
+    id: str
+    task_id: str
+    round_id: str
+    input_digest: str
+    verdict: ActionVerdict
+    request_ref: str
+    response_ref: str
+    model: str
+    thread_id: str = ""
+    turn_id: str = ""
+
+
 class RunState(Model):
     schema_version: int = 1
     run_id: str
@@ -558,6 +642,7 @@ class RunState(Model):
     plans: dict[str, PlanRevision] = Field(default_factory=dict)
     coverage: dict[str, CoverageItem] = Field(default_factory=dict)
     decisions: dict[str, DecisionRecord] = Field(default_factory=dict)
+    action_decisions: dict[str, ActionDecision] = Field(default_factory=dict)
     decision_jobs: dict[str, DecisionJob] = Field(default_factory=dict)
     verifications: dict[str, VerificationRecord] = Field(default_factory=dict)
     verification_jobs: dict[str, VerificationJob] = Field(default_factory=dict)
@@ -565,6 +650,8 @@ class RunState(Model):
     completion_certificates: dict[str, CompletionCertificate] = Field(default_factory=dict)
     artifacts: dict[str, ArtifactRef] = Field(default_factory=dict)
     background: dict[str, str] = Field(default_factory=dict)
+    branch_workspaces: dict[str, str] = Field(default_factory=dict)
+    branch_output_owners: dict[str, str] = Field(default_factory=dict)
     preparation_required: bool = False
     preparations: dict[str, PreparationRecord] = Field(default_factory=dict)
     current_preparation_id: str | None = None
@@ -579,6 +666,8 @@ class RunState(Model):
         return self.next_sequence
 
     def children(self, task_id: str) -> list[str]:
+        if self.schema_version == 3:
+            return list(self.nodes[task_id].child_ids)
         plan_id = self.nodes[task_id].current_plan_revision_id
         return self.plans[plan_id].required_child_ids if plan_id else []
 
@@ -726,11 +815,11 @@ class ExplorationReport(Model):
     )
     split_opportunities: list[SplitOpportunity] = Field(
         default_factory=list,
-        description="Historical field; MUST be [] in new exploration reports. Child planning starts only after Jev SHOULD_SPLIT authorizes DECOMPOSE.",
+        description="Historical field; MUST be [] in new exploration reports. Child planning starts only after the independent SHOULD_SPLIT judgment authorizes DECOMPOSE.",
     )
     leaf_rationale: str = Field(
         default="",
-        description="Evidence-backed assessment of task workload, complexity, cohesion and uncertainty for Jev; do not propose children or choose the route. Historical field name retained for readability.",
+        description="Evidence-backed assessment of task workload, complexity, cohesion and uncertainty for the independent judge; do not propose children or choose the route. Historical field name retained for readability.",
     )
     uncertainties: list[str] = Field(default_factory=list)
     aspect_assessments: list[AspectAssessment] = Field(default_factory=list)

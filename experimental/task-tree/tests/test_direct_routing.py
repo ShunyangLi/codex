@@ -9,6 +9,7 @@ from codex_task_tree.scheduler import select_next
 
 from .conftest import exploration_report, exploration_worker, preparation_report, spec
 from .test_preparation import new_runtime
+from .test_tree import children_report, report_for
 
 
 @pytest.fixture
@@ -64,6 +65,53 @@ def test_exploration_routes_directly_to_jev_without_scope_review(scoped):
     assert runtime.authorization_current(next_work(runtime))
     assert not runtime.state.nodes[source.task_id].result_history
     assert not any(r.kind == RoundKind.SCOPE_REVIEW for r in runtime.state.rounds.values())
+
+
+def test_one_step_continues_the_same_worker_thread_after_no_split(scoped):
+    runtime, workspace, judge = scoped
+    judge.denied.add("SHOULD_SPLIT")
+    stages = []
+
+    def worker(context, report_type, started, timeout):
+        stages.append(context["kind"])
+        started("one-worker-thread", context["kind"] + "-turn")
+        if context["kind"] == "EXPLORE":
+            return exploration_report(context)
+        assert context["kind"] == "EXECUTE"
+        assert context["continuation_thread_id"] == "one-worker-thread"
+        (workspace / "Root.txt").write_text("delivered")
+        return report_for(context, deliverable_paths=["Root.txt"])
+
+    worker.supports_continuation = True
+    runtime.worker = worker
+    runtime.step()
+    assert stages == ["EXPLORE", "EXECUTE"]
+    rounds = [
+        r for r in runtime.state.rounds.values()
+        if r.kind in {RoundKind.EXPLORE, RoundKind.EXECUTE} and r.thread_id
+    ]
+    assert [r.thread_id for r in rounds] == ["one-worker-thread", "one-worker-thread"]
+
+
+def test_one_step_plans_children_in_the_same_worker_thread_after_split(scoped):
+    runtime, _, judge = scoped
+    stages = []
+
+    def worker(context, report_type, started, timeout):
+        stages.append(context["kind"])
+        started("one-worker-thread", context["kind"] + "-turn")
+        if context["kind"] == "EXPLORE":
+            return exploration_report(context)
+        assert context["kind"] == "DECOMPOSE"
+        assert context["continuation_thread_id"] == "one-worker-thread"
+        return children_report(context, ["Child"])
+
+    worker.supports_continuation = True
+    runtime.worker = worker
+    runtime.step()
+    assert stages == ["EXPLORE", "DECOMPOSE"]
+    assert len(runtime.state.nodes) == 2
+    assert any(kind == "NECESSARY" for kind, _, _ in judge.calls)
 
 
 @pytest.mark.parametrize("invalid", ["omitted", "duplicate", "relabelled", "missing-opportunity"])
@@ -122,9 +170,9 @@ def test_source_change_revokes_direct_routing(scoped):
     assert authorized.kind == RoundKind.DECOMPOSE
     (workspace / "source.txt").write_text("changed")
     runtime.worker = lambda *_: pytest.fail("stale route must not execute")
-    runtime.step()
+    replacement = runtime.claim_next_work()
     assert authorized.phase == RoundPhase.CANCELLED
-    assert next_work(runtime).kind == RoundKind.EXPLORE
+    assert runtime.state.rounds[replacement.id].kind == RoundKind.EXPLORE
     assert len(judge.calls) == 1
 
 

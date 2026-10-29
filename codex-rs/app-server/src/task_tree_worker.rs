@@ -15,7 +15,7 @@ pub(crate) fn policy() -> ToolPolicy {
                 "view_image",
                 "update_plan",
                 "web",
-                "jev_decide",
+                "task_tree_decide",
             ]
             .into_iter()
             .map(ToolName::plain)
@@ -33,9 +33,16 @@ mod tests {
     #[test]
     fn controller_workers_cannot_delegate_or_bypass_workspace_tools() {
         let policy = policy();
-        for name in ["exec", "wait", "exec_command", "apply_patch", "jev_decide"] {
+        for name in [
+            "exec",
+            "wait",
+            "exec_command",
+            "apply_patch",
+            "task_tree_decide",
+        ] {
             assert!(policy.allows(&ToolName::plain(name)));
         }
+        assert!(!policy.allows(&ToolName::plain("jev_decide")));
         for name in ["spawn_agent", "create_goal", "update_goal"] {
             assert!(!policy.allows(&ToolName::plain(name)));
         }

@@ -8,7 +8,7 @@ import pytest
 from codex_task_tree import codex_adapter
 from codex_task_tree.cli import parser
 from codex_task_tree.codex_adapter import CodexAdapter
-from codex_task_tree.models import ExecutionProfile, WorkerReport
+from codex_task_tree.models import ActionVerdict, ExecutionProfile, WorkerReport
 
 
 @pytest.mark.parametrize("network", [False, True])
@@ -100,3 +100,28 @@ def test_network_turn_uses_native_policy_model_and_report_schema(monkeypatch, tm
 def test_cli_network_access_requires_explicit_opt_in():
     assert not parser().parse_args(["start", "task"]).allow_worker_network
     assert parser().parse_args(["start", "task", "--allow-worker-network"]).allow_worker_network
+
+
+def test_luna_uses_low_effort_without_reasoning_summaries(tmp_path):
+    adapter = object.__new__(CodexAdapter)
+    adapter.workspace = tmp_path
+    adapter.profile = ExecutionProfile(worker_effort="xhigh", decision_model="gpt-6-luna")
+    captured = {}
+
+    def start_thread(**kwargs):
+        captured["thread"] = kwargs
+        return SimpleNamespace(id="luna-thread")
+
+    def collect(thread, context, report_type, started, deadline, validator=None, **kwargs):
+        captured["turn"] = kwargs
+        assert thread.id == "luna-thread"
+        assert report_type is ActionVerdict
+        return "verdict"
+
+    adapter.codex = SimpleNamespace(thread_start=start_thread)
+    adapter._collect_report = collect
+    result = adapter.run_boolean_decision({"kind": "JUDGE"}, ActionVerdict, "rules", lambda *_: None, 10)
+    assert result == "verdict"
+    assert captured["thread"]["config"] == {"model_reasoning_summary": "none"}
+    assert captured["thread"]["model"] == "gpt-6-luna"
+    assert captured["turn"] == {"model": "gpt-6-luna", "effort": "low"}
